@@ -1,0 +1,463 @@
+// ==UserScript==
+// @name         虾皮自动关闭物流 (终极修复版)
+// @namespace    https://github.com/shopee-auto-tools
+// @version      3.0.0
+// @description  自动定时关闭 Shopee 指定物流渠道 (修复版：状态机+防休眠+多语言弹窗)
+// @author       ChatGPT
+// @match        https://seller.shopee.com.my/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    /*************************************************
+     * 配置区域 (用户修改区)
+     *************************************************/
+    const CONFIG = {
+        // 每天执行时间
+        RUN_TIMES: [
+            "01:00",
+            "07:00"
+        ],
+        // Shopee物流设置页面
+        SHIPPING_URL: "https://seller.shopee.com.my/portal/all-settings/shipping/shipping-channel",
+        // 需要关闭的物流名称
+        TARGET_CHANNELS: [
+            "Instant Delivery (Arrange in 90 mins)"
+        ],
+        CHECK_INTERVAL: 5000,   // 检查时间间隔 (10秒)
+        PAGE_TIMEOUT: 5000,     // 等待页面加载超时 (15秒)
+        CLICK_DELAY: 1500,       // 点击后的缓冲时间
+        MAX_RETRY: 3,            // 失败重试次数
+        MAX_CONFIRM: 10,         // 弹窗确认限制
+        DEBUG: true              // 日志开关
+    };
+
+    /*************************************************
+     * 日志与基础工具
+     *************************************************/
+    class Logger {
+        static time() { return new Date().toLocaleTimeString(); }
+        static info(...args) { if (CONFIG.DEBUG) console.log("%c[ShopeeAuto][" + Logger.time() + "]", "color:#42b983;font-weight:bold;", ...args); }
+        static warn(...args) { if (CONFIG.DEBUG) console.warn("%c[ShopeeAuto][" + Logger.time() + "]", "color:orange;font-weight:bold;", ...args); }
+        static error(...args) { console.error("%c[ShopeeAuto][" + Logger.time() + "]", "color:red;font-weight:bold;", ...args); }
+    }
+
+    function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+    function getToday() {
+        const d = new Date();
+        return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, "0"), String(d.getDate()).padStart(2, "0")].join("-");
+    }
+    function getCurrentTime() {
+        const d = new Date();
+        return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+    }
+    function isShippingPage() { return location.href.startsWith(CONFIG.SHIPPING_URL); }
+    function gotoShippingPage() {
+        Logger.info("正在跳转至物流设置页面...");
+        location.href = CONFIG.SHIPPING_URL;
+    }
+
+    /*************************************************
+     * 强力防休眠
+     *************************************************/
+    function keepPageAlive() {
+        try {
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContext) return;
+            const audioCtx = new AudioContext();
+            setInterval(() => {
+                if (audioCtx.state === 'suspended') audioCtx.resume();
+                const oscillator = audioCtx.createOscillator();
+                oscillator.type = 'square';
+                oscillator.frequency.setValueAtTime(0, audioCtx.currentTime);
+                oscillator.connect(audioCtx.destination);
+                oscillator.start();
+                oscillator.stop(audioCtx.currentTime + 0.01);
+            }, 20000);
+            Logger.info("后台防冻结机制已启动 (注意: 首次运行需在页面点击任意位置激活)");
+        } catch (e) {
+            Logger.warn("当前浏览器环境不支持音频唤醒", e);
+        }
+    }
+
+    /*************************************************
+     * DOM 元素操作增强版 (防误判)
+     *************************************************/
+    async function waitUntilPageReady() {
+        Logger.info("等待物流页面组件加载...");
+        const start = Date.now();
+        while (Date.now() - start < CONFIG.PAGE_TIMEOUT) {
+            if (document.querySelector('[data-testid="channel-enable-toggle"]')) return true;
+            await sleep(500);
+        }
+        Logger.warn("页面加载超时，未找到物流组件");
+        return false;
+    }
+
+    // 检查按钮是否处于开启状态 (三重判断)
+function isToggleOn(toggle) {
+
+    if (!toggle) return false;
+
+
+    // Shopee真实状态判断
+    if (
+        toggle.classList.contains(
+            "eds-switch--open"
+        )
+    ) {
+
+        return true;
+
+    }
+
+
+    if (
+        toggle.classList.contains(
+            "eds-switch--close"
+        )
+    ) {
+
+        return false;
+
+    }
+
+
+    return false;
+
+}
+
+    // 精准点击 (解决React合成事件无效的问题)
+function clickToggle(toggle){
+
+    const event =
+        new MouseEvent(
+            "click",
+            {
+                bubbles:true,
+                cancelable:true,
+                view:window
+            }
+        );
+
+
+    toggle.dispatchEvent(event);
+
+}
+
+    // 动态定位物流开关
+function findTargetChannels(){
+
+    const result=[];
+
+
+    document
+    .querySelectorAll(
+        ".channel-setting-header"
+    )
+    .forEach(row=>{
+
+
+        const nameEl =
+        row.querySelector(
+            ".channel-name"
+        );
+
+
+        if(!nameEl)
+            return;
+
+
+        const name =
+        nameEl.innerText.trim();
+
+
+
+        if(
+            CONFIG.TARGET_CHANNELS
+            .includes(name)
+        ){
+
+
+            const toggle =
+            row.querySelector(
+              '[data-testid="channel-enable-toggle"]'
+            );
+
+
+            if(toggle){
+
+                result.push({
+                    name,
+                    toggle
+                });
+
+            }
+
+        }
+
+
+    });
+
+
+    return result;
+
+}
+
+    function findSpecificToggle(targetName) {
+        const channels = findTargetChannels();
+        const found = channels.find(c => c.name === targetName);
+        return found ? found.toggle : null;
+    }
+
+function realClick(element){
+
+    if(!element){
+        return false;
+    }
+
+
+    [
+        "mousedown",
+        "mouseup",
+        "click"
+    ].forEach(type=>{
+
+        element.dispatchEvent(
+            new MouseEvent(type,{
+                bubbles:true,
+                cancelable:true,
+                view:window
+            })
+        );
+
+    });
+
+
+    return true;
+
+}
+    /*************************************************
+     * 弹窗处理模块 (修复多语言支持)
+     *************************************************/
+function findActiveModal(){
+
+    const modals =
+    document.querySelectorAll(
+        ".eds-modal__content"
+    );
+
+
+    for(const modal of modals){
+
+
+        if(
+            modal.offsetParent === null
+        ){
+            continue;
+        }
+
+
+        const text =
+        modal.innerText.trim();
+
+
+        if(
+            text.length < 2
+        ){
+            continue;
+        }
+
+
+        return modal;
+
+    }
+
+
+    return null;
+
+}
+    function findModalConfirm(modal) {
+        // 优先寻找主干按钮 (蓝色确认按钮)
+        const primaryBtn = modal.querySelector(".eds-modal__footer .eds-button--primary");
+        if (primaryBtn && !primaryBtn.disabled) return primaryBtn;
+
+        // 备用：关键字匹配 (支持大马站英文环境)
+        const buttons = modal.querySelectorAll(".eds-modal__footer button");
+        const keywords = ["确认", "确定", "confirm", "ok", "yes", "sure"];
+        for (const button of buttons) {
+            if (button.disabled) continue;
+            const text = button.innerText.trim().toLowerCase();
+            if (keywords.includes(text)) return button;
+        }
+        return null;
+    }
+
+    async function processAllConfirm() {
+        Logger.info("检查是否有二次确认弹窗...");
+        await sleep(1000); // 给弹窗弹出动画留出时间
+
+        let confirmCount = 0;
+        while (confirmCount < CONFIG.MAX_CONFIRM) {
+            const modal = findActiveModal();
+            if (!modal) {
+                if (confirmCount > 0) Logger.info("弹窗已全部处理完毕");
+                return;
+            }
+            const button = findModalConfirm(modal);
+            if (!button) {
+                Logger.warn("发现弹窗，但未找到支持的确认按钮！");
+                return;
+            }
+            realClick(button);
+            confirmCount++;
+            Logger.info(`已点击弹窗确认按钮 (第 ${confirmCount} 次)`);
+            await sleep(CONFIG.CLICK_DELAY + 500);
+        }
+    }
+
+    /*************************************************
+     * 核心业务逻辑
+     *************************************************/
+    async function closeSingleChannel(channel) {
+        const { name, toggle } = channel;
+
+        if (!isToggleOn(toggle)) {
+            Logger.info(`[${name}] 已是关闭状态，无需操作`);
+            return true;
+        }
+
+        Logger.info(`[${name}] 当前处于开启状态，准备执行关闭...`);
+        clickToggle(toggle);
+        await sleep(CONFIG.CLICK_DELAY);
+        await processAllConfirm();
+        await sleep(2000); // 等待网络接口响应
+
+        // 重新获取该节点的最新状态（防止 React 刷新旧 DOM）
+        const latestToggle = findSpecificToggle(name);
+        if (!latestToggle) {
+            Logger.warn(`[${name}] 操作后组件丢失，可能是页面重新渲染`);
+            return false;
+        }
+
+        if (!isToggleOn(latestToggle)) {
+            Logger.info(`[${name}] 关闭成功！`);
+            return true;
+        }
+
+        Logger.warn(`[${name}] 尝试关闭失败，按钮状态未发生变化`);
+        return false;
+    }
+
+    async function processChannel() {
+        const channels = findTargetChannels();
+        if (channels.length === 0) {
+            Logger.warn("当前页面未发现目标物流，请检查名称是否填写错误");
+            return true; // 没找到则直接判定完成，防止死循环
+        }
+        for (const channel of channels) {
+            const ok = await closeSingleChannel(channel);
+            if (!ok) return false;
+            await sleep(CONFIG.CLICK_DELAY);
+        }
+        return true;
+    }
+
+    async function startTask() {
+        Logger.info(">>> 开始执行核心关闭任务 <<<");
+        let retry = 0;
+        while (retry < CONFIG.MAX_RETRY) {
+            const success = await processChannel();
+            if (success) {
+                Logger.info("=== 当前时段任务圆满完成 ===");
+                return true;
+            }
+            retry++;
+            Logger.warn(`执行受阻，准备第 ${retry} 次重试...`);
+            await sleep(3000);
+        }
+        Logger.error("达到最大重试限制，放弃当前任务");
+        return false;
+    }
+
+    /*************************************************
+     * 核心状态机 (解决跳转断档 Bug)
+     *************************************************/
+    function getExpectedTaskId() {
+        const now = getCurrentTime();
+        if (CONFIG.RUN_TIMES.includes(now)) {
+            return getToday() + "_" + now;
+        }
+        return null;
+    }
+
+    async function checkAndRun() {
+        const expectedTask = getExpectedTaskId();
+        const currentTask = sessionStorage.getItem("shopee_task_id");
+
+        // 1. 发现新任务，重置状态
+        if (expectedTask && currentTask !== expectedTask) {
+            Logger.info("时间到！发起新任务:", expectedTask);
+            sessionStorage.setItem("shopee_task_id", expectedTask);
+            sessionStorage.setItem("shopee_task_status", "running");
+        }
+
+        // 2. 状态机推进
+        const activeStatus = sessionStorage.getItem("shopee_task_status");
+        if (activeStatus === "running") {
+            if (!isShippingPage()) {
+                Logger.info("当前不在物流页面，即将自动跳转，请勿操作页面...");
+                gotoShippingPage();
+                return; // 退出当前循环，等待刷新后接力
+            }
+
+            // 成功在物流页面，开始加锁执行
+            Logger.info("接力成功，准备操作页面...");
+            sessionStorage.setItem("shopee_task_status", "processing");
+
+            const ready = await waitUntilPageReady();
+            if (!ready) {
+                Logger.warn("页面加载异常，重置状态等待下一轮检测");
+                sessionStorage.setItem("shopee_task_status", "running");
+                return;
+            }
+
+            try {
+                await startTask();
+            } catch(e) {
+                Logger.error("执行过程发生未捕获异常:", e);
+            } finally {
+                // 无论成功还是失败，锁死当前任务，防止同一分钟内重复运行
+                sessionStorage.setItem("shopee_task_status", "completed");
+            }
+        }
+    }
+
+    /*************************************************
+     * 启动入口
+     *************************************************/
+    async function init() {
+        Logger.info("==========================");
+        Logger.info("Shopee Auto Close Pro v3.0 启动");
+        Logger.info("运行节点:", CONFIG.RUN_TIMES);
+        Logger.info("防休眠引擎: 激活");
+        Logger.info("==========================");
+
+        keepPageAlive();
+
+        // 页面刚加载时立即检查一次状态接力
+        checkAndRun();
+
+        // 常规循环巡逻
+        setInterval(checkAndRun, CONFIG.CHECK_INTERVAL);
+    }
+
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", init);
+    } else {
+        init();
+    }
+})();
